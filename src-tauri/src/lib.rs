@@ -95,10 +95,13 @@ fn init_database() -> Result<String, String> {
     if let Some(proj_dirs) = ProjectDirs::from("com", "cliped", "cliped") {
         let data_dir = proj_dirs.data_dir();
         std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
-        
+
         let db_path = data_dir.join("clipboard.db");
         let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
-        
+
+        // Enable WAL mode for better concurrency (use query since PRAGMA returns results)
+        let _ = conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()));
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS clipboard_items (
                 id TEXT PRIMARY KEY,
@@ -267,23 +270,47 @@ fn get_clipboard_files_paginated_from_db(db_path: &str, offset: u32, limit: u32)
 }
 
 fn save_clipboard_item_to_db(db_path: &str, item: &ClipboardItem) -> Result<(), String> {
+    use std::time::Duration;
+    use std::thread;
+
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
-    
-    conn.execute(
-        "INSERT OR REPLACE INTO clipboard_items (id, content, timestamp, device, content_type, file_path, file_size, file_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        [
-            &item.id, 
-            &item.content, 
-            &item.timestamp, 
-            &item.device, 
-            &item.content_type,
-            &item.file_path.as_ref().unwrap_or(&String::new()),
-            &item.file_size.map(|s| s.to_string()).unwrap_or_default(),
-            &item.file_name.as_ref().unwrap_or(&String::new()),
-        ],
-    ).map_err(|e| e.to_string())?;
-    
-    Ok(())
+
+    // Set busy timeout to handle database locks
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+
+    // Retry logic for database locked errors
+    let max_retries = 3;
+    let mut last_error = String::new();
+
+    for attempt in 0..max_retries {
+        match conn.execute(
+            "INSERT OR REPLACE INTO clipboard_items (id, content, timestamp, device, content_type, file_path, file_size, file_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            [
+                &item.id,
+                &item.content,
+                &item.timestamp,
+                &item.device,
+                &item.content_type,
+                &item.file_path.as_ref().unwrap_or(&String::new()),
+                &item.file_size.map(|s| s.to_string()).unwrap_or_default(),
+                &item.file_name.as_ref().unwrap_or(&String::new()),
+            ],
+        ) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_error = e.to_string();
+                if last_error.contains("database is locked") && attempt < max_retries - 1 {
+                    thread::sleep(Duration::from_millis(100 * (attempt + 1) as u64));
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_error)
 }
 
 fn clear_clipboard_history_from_db(db_path: &str) -> Result<(), String> {
@@ -810,7 +837,8 @@ pub fn run() {
             show_open_dialog,
             show_save_dialog,
             get_file_preview,
-            get_files_storage_directory_path
+            get_files_storage_directory_path,
+            move_clipboard_item_to_top
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -832,21 +860,19 @@ async fn monitor_clipboard(
 ) {
     println!("Clipboard monitoring started!");
     let mut clipboard = Clipboard::new().unwrap();
-    
-    // Get database path and ignore flag
-    let (db_path, ignore_flag) = {
+
+    // Get ignore flag reference (this won't change)
+    let ignore_flag = {
         let app_state = app_handle.state::<AppState>();
-        let db_path = app_state.db_path.lock().unwrap().clone();
-        let ignore_flag = Arc::clone(&app_state.ignore_next_clipboard_change);
-        (db_path, ignore_flag)
+        Arc::clone(&app_state.ignore_next_clipboard_change)
     };
-    
+
     // Check if clipboard is available first
     if clipboard.get_text().is_err() {
         println!("Clipboard not available on this platform - skipping clipboard monitoring");
         return;
     }
-    
+
     loop {
         sleep(Duration::from_millis(500)).await;
         
@@ -905,11 +931,17 @@ async fn monitor_clipboard(
                     println!("Clipboard history now has {} items", history.len());
                 } // Drop the history lock here
 
-                // Save to database
+                // Save to database (get db_path fresh from app state)
+                let app_state = app_handle.state::<AppState>();
+                let db_path = app_state.db_path.lock().unwrap().clone();
+
                 if let Some(ref db_path) = db_path {
-                    if let Err(e) = save_clipboard_item_to_db(db_path, &item) {
-                        eprintln!("Failed to save clipboard item to database: {}", e);
+                    match save_clipboard_item_to_db(db_path, &item) {
+                        Ok(_) => println!("✓ Saved clipboard item to database"),
+                        Err(e) => eprintln!("✗ Failed to save clipboard item to database: {}", e),
                     }
+                } else {
+                    eprintln!("✗ Database not initialized - cannot save clipboard item");
                 }
 
                 // Check if we have connected devices before syncing
@@ -1848,4 +1880,42 @@ async fn get_file_preview(file_path: String, max_length: Option<usize>) -> Resul
 #[tauri::command]
 async fn get_files_storage_directory_path() -> Result<String, String> {
     get_files_storage_directory()
+}
+
+#[tauri::command]
+async fn move_clipboard_item_to_top(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let db_path = state.db_path.lock().unwrap().clone();
+    if let Some(db_path) = db_path {
+        let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+        
+        // Get the current item
+        let mut stmt = conn.prepare(
+            "SELECT id, content, timestamp, device, content_type, file_path, file_size, file_name FROM clipboard_items WHERE id = ?1"
+        ).map_err(|e| e.to_string())?;
+        
+        let item = stmt.query_row([&id], |row| {
+            Ok(ClipboardItem {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                timestamp: row.get(2)?,
+                device: row.get(3)?,
+                content_type: row.get(4)?,
+                file_path: row.get(5).ok(),
+                file_size: row.get(6).ok(),
+                file_name: row.get(7).ok(),
+            })
+        }).map_err(|e| e.to_string())?;
+        
+        // Update the timestamp to current time to make it appear at the top
+        let current_timestamp = get_current_timestamp().to_string();
+        let mut updated_item = item;
+        updated_item.timestamp = current_timestamp;
+        
+        // Save the updated item back to the database
+        save_clipboard_item_to_db(&db_path, &updated_item)?;
+        
+        Ok(())
+    } else {
+        Err("Database not initialized".to_string())
+    }
 }

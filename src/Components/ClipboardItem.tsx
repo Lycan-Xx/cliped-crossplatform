@@ -9,9 +9,9 @@ type Props = {
 };
 
 const formatFileSize = (bytes: number): string => {
-  if (bytes === 0) return "0 Bytes";
+  if (bytes === 0) return "0 B";
   const k = 1024;
-  const sizes = ["Bytes", "KB", "MB", "GB"];
+  const sizes = ["B", "KB", "MB", "GB", "TB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
 };
@@ -52,6 +52,8 @@ export default function ClipboardItemCard({ item, onDelete, onSelect }: Props) {
         loadFilePreview();
       }
       setIsExpanded(!isExpanded);
+      // Also move file to top when clicked
+      onSelect(item.content);
     } else {
       // For text/image items, copy to clipboard
       onSelect(item.content);
@@ -96,7 +98,18 @@ export default function ClipboardItemCard({ item, onDelete, onSelect }: Props) {
       return timestamp;
     }
 
-    const date = new Date(timestamp);
+    // Try to parse as Unix timestamp (seconds since epoch)
+    const unixTimestamp = parseInt(timestamp);
+    let date: Date;
+
+    if (!isNaN(unixTimestamp) && unixTimestamp > 1000000000) {
+      // If it's a valid Unix timestamp (greater than 1000000000 to distinguish from regular numbers)
+      date = new Date(unixTimestamp * 1000); // Convert seconds to milliseconds
+    } else {
+      // Otherwise try to parse as ISO string or other date format
+      date = new Date(timestamp);
+    }
+
     if (isNaN(date.getTime())) {
       return timestamp; // Return as-is if can't parse
     }

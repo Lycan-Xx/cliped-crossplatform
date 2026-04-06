@@ -88,7 +88,7 @@ export function useClipboard() {
             }
             return prev;
           });
-          
+
           setTotalCount(count);
         } else {
           // Still update the total count for other pages
