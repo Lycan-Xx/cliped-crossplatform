@@ -227,13 +227,65 @@ fn get_clipboard_history_count_from_db(db_path: &str) -> Result<u32, String> {
 
 fn get_clipboard_files_count_from_db(db_path: &str) -> Result<u32, String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
-    
+
     let count: u32 = conn.query_row(
         "SELECT COUNT(*) FROM clipboard_items WHERE content_type = 'file'",
         [],
         |row| row.get(0)
     ).map_err(|e| e.to_string())?;
-    
+
+    Ok(count)
+}
+
+fn search_clipboard_items(db_path: &str, query: &str, offset: u32, limit: u32) -> Result<Vec<ClipboardItem>, String> {
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+
+    // Use LIKE for substring matching with case-insensitive search
+    let search_pattern = format!("%{}%", query);
+
+    let mut stmt = conn.prepare(
+        "SELECT id, content, timestamp, device, content_type, file_path, file_size, file_name
+         FROM clipboard_items
+         WHERE (content LIKE ?1 COLLATE NOCASE OR file_name LIKE ?1 COLLATE NOCASE)
+         AND content_type != 'file'
+         ORDER BY timestamp DESC
+         LIMIT ?2 OFFSET ?3"
+    ).map_err(|e| e.to_string())?;
+
+    let clipboard_iter = stmt.query_map([&search_pattern, &limit.to_string(), &offset.to_string()], |row| {
+        Ok(ClipboardItem {
+            id: row.get(0)?,
+            content: row.get(1)?,
+            timestamp: row.get(2)?,
+            device: row.get(3)?,
+            content_type: row.get(4)?,
+            file_path: row.get(5).ok(),
+            file_size: row.get(6).ok(),
+            file_name: row.get(7).ok(),
+        })
+    }).map_err(|e| e.to_string())?;
+
+    let mut items = Vec::new();
+    for item in clipboard_iter {
+        items.push(item.map_err(|e| e.to_string())?);
+    }
+
+    Ok(items)
+}
+
+fn get_search_results_count(db_path: &str, query: &str) -> Result<u32, String> {
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+
+    let search_pattern = format!("%{}%", query);
+
+    let count: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM clipboard_items
+         WHERE (content LIKE ?1 COLLATE NOCASE OR file_name LIKE ?1 COLLATE NOCASE)
+         AND content_type != 'file'",
+        [&search_pattern],
+        |row| row.get(0)
+    ).map_err(|e| e.to_string())?;
+
     Ok(count)
 }
 
@@ -811,6 +863,8 @@ pub fn run() {
             get_clipboard_history_count,
             get_clipboard_files_count,
             get_clipboard_files_paginated,
+            search_clipboard,
+            get_search_count,
             clear_clipboard_history,
             delete_clipboard_item,
             set_clipboard_content,
@@ -1141,6 +1195,26 @@ async fn get_clipboard_files_paginated(state: State<'_, AppState>, offset: u32, 
     let db_path = state.db_path.lock().unwrap().clone();
     if let Some(db_path) = db_path {
         get_clipboard_files_paginated_from_db(&db_path, offset, limit)
+    } else {
+        Err("Database not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn search_clipboard(state: State<'_, AppState>, query: String, offset: u32, limit: u32) -> Result<Vec<ClipboardItem>, String> {
+    let db_path = state.db_path.lock().unwrap().clone();
+    if let Some(db_path) = db_path {
+        search_clipboard_items(&db_path, &query, offset, limit)
+    } else {
+        Err("Database not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_search_count(state: State<'_, AppState>, query: String) -> Result<u32, String> {
+    let db_path = state.db_path.lock().unwrap().clone();
+    if let Some(db_path) = db_path {
+        get_search_results_count(&db_path, &query)
     } else {
         Err("Database not initialized".to_string())
     }

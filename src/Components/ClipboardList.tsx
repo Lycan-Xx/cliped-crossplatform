@@ -38,12 +38,18 @@ export default function ClipboardList({ onOpenSettings }: ClipboardListProps) {
   const [searchText, setSearchText] = useState("");
   const [viewMode, setViewMode] = useState<ViewMode>("all");
   const [showFileTransfer, setShowFileTransfer] = useState(false);
-  
+
   // Separate state for files view
   const [filesItems, setFilesItems] = useState<ClipboardItem[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
   const [filesCurrentPage, setFilesCurrentPage] = useState(0);
   const [filesTotalCount, setFilesTotalCount] = useState(0);
+
+  // Separate state for search results
+  const [searchItems, setSearchItems] = useState<ClipboardItem[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchCurrentPage, setSearchCurrentPage] = useState(0);
+  const [searchTotalCount, setSearchTotalCount] = useState(0);
 
   // Load files when switching to files view
   const loadFilesPage = async (page: number) => {
@@ -69,6 +75,31 @@ export default function ClipboardList({ onOpenSettings }: ClipboardListProps) {
     }
   };
 
+  // Load search results
+  const loadSearchPage = async (page: number, query: string) => {
+    if (searchLoading || !query.trim()) return;
+
+    try {
+      setSearchLoading(true);
+      const [searchResults, searchCount] = await Promise.all([
+        invoke<ClipboardItem[]>("search_clipboard", {
+          query: query,
+          offset: page * itemsPerPage,
+          limit: itemsPerPage
+        }),
+        invoke<number>("get_search_count", { query: query }),
+      ]);
+
+      setSearchItems(searchResults);
+      setSearchCurrentPage(page);
+      setSearchTotalCount(searchCount);
+    } catch (error) {
+      console.error("Failed to search clipboard:", error);
+    } finally {
+      setSearchLoading(false);
+    }
+  };
+
   // Load files when viewMode changes to files
   useEffect(() => {
     if (viewMode === "files") {
@@ -76,18 +107,37 @@ export default function ClipboardList({ onOpenSettings }: ClipboardListProps) {
     }
   }, [viewMode]);
 
-  // Get the appropriate items and pagination info based on view mode
-  const currentItems = viewMode === "files" ? filesItems : items;
-  const currentLoading = viewMode === "files" ? filesLoading : loading;
-  const currentPage_display = viewMode === "files" ? filesCurrentPage : currentPage;
-  const currentTotalCount = viewMode === "files" ? filesTotalCount : totalCount;
-  
-  const filteredItems = currentItems.filter((item) => {
-    const matchesSearch = item.content.toLowerCase().includes(searchText.toLowerCase()) ||
-                         (item.file_name && item.file_name.toLowerCase().includes(searchText.toLowerCase()));
-    
-    return matchesSearch;
-  });
+  // Trigger search when searchText changes
+  useEffect(() => {
+    if (searchText.trim()) {
+      loadSearchPage(0, searchText);
+    }
+  }, [searchText]);
+
+  // Get the appropriate items and pagination info based on search/view mode
+  const isSearching = searchText.trim().length > 0;
+  const currentItems = isSearching
+    ? searchItems
+    : viewMode === "files"
+    ? filesItems
+    : items;
+  const currentLoading = isSearching
+    ? searchLoading
+    : viewMode === "files"
+    ? filesLoading
+    : loading;
+  const currentPage_display = isSearching
+    ? searchCurrentPage
+    : viewMode === "files"
+    ? filesCurrentPage
+    : currentPage;
+  const currentTotalCount = isSearching
+    ? searchTotalCount
+    : viewMode === "files"
+    ? filesTotalCount
+    : totalCount;
+
+  const filteredItems = currentItems;
 
   const handleFileAdded = () => {
     setShowFileTransfer(false);
@@ -98,9 +148,14 @@ export default function ClipboardList({ onOpenSettings }: ClipboardListProps) {
     // The useClipboard hook will automatically refresh for "all" view
   };
 
-  // Navigation functions that work for both view modes
+  // Navigation functions that work for search, files, and all modes
   const handleNextPage = () => {
-    if (viewMode === "files") {
+    if (isSearching) {
+      const maxPage = Math.ceil(searchTotalCount / itemsPerPage) - 1;
+      if (searchCurrentPage < maxPage) {
+        loadSearchPage(searchCurrentPage + 1, searchText);
+      }
+    } else if (viewMode === "files") {
       const maxPage = Math.ceil(filesTotalCount / itemsPerPage) - 1;
       if (filesCurrentPage < maxPage) {
         loadFilesPage(filesCurrentPage + 1);
@@ -111,7 +166,11 @@ export default function ClipboardList({ onOpenSettings }: ClipboardListProps) {
   };
 
   const handlePreviousPage = () => {
-    if (viewMode === "files") {
+    if (isSearching) {
+      if (searchCurrentPage > 0) {
+        loadSearchPage(searchCurrentPage - 1, searchText);
+      }
+    } else if (viewMode === "files") {
       if (filesCurrentPage > 0) {
         loadFilesPage(filesCurrentPage - 1);
       }
@@ -120,12 +179,16 @@ export default function ClipboardList({ onOpenSettings }: ClipboardListProps) {
     }
   };
 
-  const canGoNextPage = viewMode === "files" 
+  const canGoNextPage = isSearching
+    ? searchCurrentPage < Math.ceil(searchTotalCount / itemsPerPage) - 1
+    : viewMode === "files"
     ? filesCurrentPage < Math.ceil(filesTotalCount / itemsPerPage) - 1
     : canGoNext;
-    
-  const canGoPreviousPage = viewMode === "files" 
-    ? filesCurrentPage > 0 
+
+  const canGoPreviousPage = isSearching
+    ? searchCurrentPage > 0
+    : viewMode === "files"
+    ? filesCurrentPage > 0
     : canGoPrevious;
     
   const totalPages_display = Math.ceil(currentTotalCount / itemsPerPage);
@@ -212,8 +275,8 @@ export default function ClipboardList({ onOpenSettings }: ClipboardListProps) {
       {/* Items count and pagination info */}
       {currentItems.length > 0 && (
         <div className="items-count">
-          {searchText ? (
-            `${filteredItems.length} of ${currentTotalCount > 0 ? currentTotalCount : currentItems.length} ${viewMode === "files" ? "files" : "items"} (filtered)`
+          {isSearching ? (
+            `Found ${currentTotalCount} ${currentTotalCount === 1 ? 'result' : 'results'} for "${searchText}"`
           ) : (
             `Showing ${currentPage_display * itemsPerPage + 1}-${Math.min((currentPage_display + 1) * itemsPerPage, currentTotalCount)} of ${currentTotalCount} ${viewMode === "files" ? "files" : "items"}`
           )}
@@ -221,7 +284,7 @@ export default function ClipboardList({ onOpenSettings }: ClipboardListProps) {
       )}
 
       {/* Top Pagination Controls */}
-      {!searchText && totalPages_display > 1 && (
+      {totalPages_display > 1 && (
         <div className="pagination-container top">
           <button
             className="pagination-button previous"
@@ -282,7 +345,7 @@ export default function ClipboardList({ onOpenSettings }: ClipboardListProps) {
               />
             ))}
             {/* Bottom Pagination Controls */}
-            {!searchText && totalPages_display > 1 && (
+            {totalPages_display > 1 && (
               <div className="pagination-container bottom">
                 <button
                   className="pagination-button previous"
