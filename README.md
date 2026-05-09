@@ -1,3 +1,5 @@
+[![Release](https://github.com/Lycan-Xx/cliped-crossplatform/actions/workflows/release.yml/badge.svg)](https://github.com/Lycan-Xx/cliped-crossplatform/actions/workflows/release.yml)
+
 # 📋 Cliped Cross-Platform - Beautiful Cross-Platform Clipboard Manager
 
 A modern, beautiful clipboard manager built with Rust (Tauri) and React. Features a stunning frosted glass UI and seamless clipboard monitoring across all platforms.
